@@ -293,8 +293,9 @@ export default function MistyBloomsCRM() {
         const now = new Date().toISOString();
         const baseId = Date.now();
         const defaultShops = [
-          { id: `shop_${baseId}_a1`, name: 'Shefa Mehadrin', contactName: 'Mendel', email: 'Mendel@kingskosher.com', phone: '', address: '49-53 Bury New Rd\nPrestwich\nManchester\nM25 9JY', commissionRate: '20', notes: '', createdAt: now, updatedAt: now },
-          { id: `shop_${baseId}_a2`, name: 'K Outlet', contactName: '', email: '', phone: '', address: '6-9, Park Hill\nBury Old Rd\nPrestwich\nManchester\nM25 0FX', commissionRate: '20', notes: '', createdAt: now, updatedAt: now },
+          { id: `shop_${baseId}_a1`, name: 'Shefa Mehadrin', contactName: 'Mendel', email: 'Mendel@kingskosher.com', phone: '', address: '49-53 Bury New Rd\nPrestwich\nManchester\nM25 9JY', commissionRate: '20', customerType: 'business', notes: '', createdAt: now, updatedAt: now },
+          { id: `shop_${baseId}_a2`, name: 'K Outlet', contactName: '', email: '', phone: '', address: '6-9, Park Hill\nBury Old Rd\nPrestwich\nManchester\nM25 0FX', commissionRate: '20', customerType: 'business', notes: '', createdAt: now, updatedAt: now },
+          { id: `shop_${baseId}_a3`, name: 'Hampers Kosher Supermarket', contactName: '', email: '', phone: '', address: '', commissionRate: '20', customerType: 'business', notes: '', createdAt: now, updatedAt: now },
         ];
         const defaultProducts = [
           { id: `product_${baseId}_b1`, name: 'Roses Mix', unit: 'bouquet', stock: '0', cost: '', price: '', notes: 'Mixed colour roses bouquet', createdAt: now, updatedAt: now },
@@ -306,6 +307,59 @@ export default function MistyBloomsCRM() {
         for (const prod of defaultProducts) await storageSet(`product:${prod.id}`, JSON.stringify(prod));
         await storageSet('meta:seeded', JSON.stringify({ at: now }));
         s = defaultShops; p = defaultProducts;
+      }
+
+      // ===== Migration v2: customerType (business / private) =====
+      // Rule: 3 known shop names = business; all others = private (no commission).
+      // Saves original commissionRate as commissionRateOriginal for transparency.
+      const migrationDone = await storageGet('meta:migrated-customertype');
+      if (!migrationDone) {
+        const BUSINESS_PATTERNS = ['shefa mehadrin', 'hampers kosher supermarket', 'k outlet'];
+        const isBusinessName = (name) => BUSINESS_PATTERNS.some(p => (name || '').toLowerCase().includes(p));
+        const nowIso = new Date().toISOString();
+
+        // Migrate shops
+        const updatedShops = [];
+        for (const shop of s) {
+          if (!shop.customerType) {
+            const isB = isBusinessName(shop.name);
+            const migrated = {
+              ...shop,
+              customerType: isB ? 'business' : 'private',
+              commissionRateOriginal: shop.commissionRate || '20',
+              commissionRate: isB ? (shop.commissionRate || '20') : '0',
+              updatedAt: nowIso,
+            };
+            await storageSet(`shop:${shop.id}`, JSON.stringify(migrated));
+            updatedShops.push(migrated);
+          } else {
+            updatedShops.push(shop);
+          }
+        }
+        s = updatedShops;
+
+        // Migrate consignments — inherit customerType from their shop
+        const updatedConsign = [];
+        for (const con of c) {
+          if (!con.customerType) {
+            const shop = updatedShops.find(x => x.id === con.shopId);
+            const cType = shop?.customerType || 'private';
+            const migrated = {
+              ...con,
+              customerType: cType,
+              commissionRateOriginal: con.commissionRate || '20',
+              commissionRate: cType === 'business' ? (con.commissionRate || '20') : '0',
+              updatedAt: nowIso,
+            };
+            await storageSet(`consign:${con.id}`, JSON.stringify(migrated));
+            updatedConsign.push(migrated);
+          } else {
+            updatedConsign.push(con);
+          }
+        }
+        c = updatedConsign;
+
+        await storageSet('meta:migrated-customertype', JSON.stringify({ at: nowIso }));
       }
 
       setShops(s);
@@ -476,11 +530,12 @@ export default function MistyBloomsCRM() {
     const items = consign.items || [];
     const subtotal = items.reduce((s, it) => s + (parseFloat(it.price) || 0) * (parseInt(it.qty) || 0), 0);
     const sold = items.reduce((s, it) => s + (parseFloat(it.price) || 0) * (parseInt(it.soldQty) || 0), 0);
-    const commissionRate = parseFloat(consign.commissionRate) || 20;
+    const isPrivate = consign.customerType === 'private';
+    const commissionRate = isPrivate ? 0 : (parseFloat(consign.commissionRate) || 20);
     const shopShare = sold * (commissionRate / 100);
     const owedToYou = sold - shopShare;
     const returnedValue = items.reduce((s, it) => s + (parseFloat(it.price) || 0) * (parseInt(it.returnedQty) || 0), 0);
-    return { subtotal, sold, shopShare, owedToYou, returnedValue, commissionRate };
+    return { subtotal, sold, shopShare, owedToYou, returnedValue, commissionRate, isPrivate };
   };
 
   const totalDelivered = consignments.reduce((s, c) => s + calc(c).subtotal, 0);
@@ -492,7 +547,8 @@ export default function MistyBloomsCRM() {
     if (c.status === 'cancelled') return sum;
     const items = c.items || [];
     const revenue = items.reduce((s, it) => s + (parseFloat(it.price) || 0) * (parseInt(it.soldQty) || 0), 0);
-    const commission = revenue * ((parseFloat(c.commissionRate) || 20) / 100);
+    const isPrivate = c.customerType === 'private';
+    const commission = isPrivate ? 0 : revenue * ((parseFloat(c.commissionRate) || 20) / 100);
     const myRevenue = revenue - commission;
     const cost = items.reduce((s, it) => {
       const product = products.find(p => p.id === it.productId);
@@ -877,13 +933,13 @@ export default function MistyBloomsCRM() {
         {/* SHOPS */}
         {activeTab === 'shops' && (
           <ListView
-            title="Shops" subtitle="Retail partners taking your stock"
+            title="Customers" subtitle="Shops and private customers"
             items={shops.filter(s => !search || s.name?.toLowerCase().includes(search.toLowerCase()) || s.contactName?.toLowerCase().includes(search.toLowerCase()))}
             search={search} setSearch={setSearch}
             onAdd={() => { setEditingItem(null); setShowForm('shop'); }}
             onEdit={(item) => { setEditingItem(item); setShowForm('shop'); }}
             onDelete={(id) => deleteItem('shop', id)}
-            emptyText="No shops yet. Add your first retail partner."
+            emptyText="No customers yet. Add a private customer or a shop partner."
             renderItem={(s) => {
               const shopConsigns = consignments.filter(c => c.shopId === s.id);
               const owedFromShop = shopConsigns.filter(c => c.status !== 'paid' && c.status !== 'cancelled').reduce((sum, c) => sum + calc(c).owedToYou, 0);
@@ -905,7 +961,11 @@ export default function MistyBloomsCRM() {
                     {s.phone && <Detail icon={Phone}>{s.phone}</Detail>}
                     {s.email && <Detail icon={Mail}>{s.email}</Detail>}
                     {s.address && <Detail icon={MapPin}>{s.address}</Detail>}
-                    <Detail icon={TrendingUp}>{s.commissionRate || 20}% commission to shop</Detail>
+                    <Detail icon={TrendingUp}>
+                      {s.customerType === 'private'
+                        ? '👤 Private customer — no commission'
+                        : `🏪 Business — ${s.commissionRate || 20}% commission`}
+                    </Detail>
                   </div>
                 </>
               );
@@ -1252,19 +1312,43 @@ function escapeHtml(str) {
 // ============== FORMS ==============
 
 function ShopForm({ initial, onSave, onClose }) {
-  const [d, setD] = useState(initial || { name: '', contactName: '', phone: '', email: '', address: '', commissionRate: '20', notes: '' });
-  const submit = (e) => { e?.preventDefault(); if (!d.name?.trim()) return alert('Shop name is required'); onSave(d); };
+  const [d, setD] = useState(initial || { name: '', contactName: '', phone: '', email: '', address: '', commissionRate: '0', customerType: 'private', notes: '' });
+  const submit = (e) => {
+    e?.preventDefault();
+    if (!d.name?.trim()) return alert('Customer name is required');
+    // Force consistency: private = 0% commission
+    const finalData = d.customerType === 'private' ? { ...d, commissionRate: '0' } : d;
+    onSave(finalData);
+  };
+  const isPrivate = d.customerType === 'private';
   return (
-    <Modal title={initial ? 'Edit Shop' : 'New Shop'} onClose={onClose} footer={<SaveBtn onClick={submit} />}>
+    <Modal title={initial ? 'Edit Customer' : 'New Customer'} onClose={onClose} footer={<SaveBtn onClick={submit} />}>
       <div>
-        <FormGroup label="Shop name *"><input style={inputCls} value={d.name} onChange={(e) => setD({ ...d, name: e.target.value })} placeholder="e.g. The Petal Studio" autoFocus /></FormGroup>
-        <FormGroup label="Contact person"><input style={inputCls} value={d.contactName || ''} onChange={(e) => setD({ ...d, contactName: e.target.value })} placeholder="Owner / manager name" /></FormGroup>
+        <FormGroup label="Customer type">
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button type="button" onClick={() => setD({ ...d, customerType: 'private', commissionRate: '0' })}
+              style={{ flex: 1, padding: '10px 14px', borderRadius: 10, border: `2px solid ${isPrivate ? T.sage : T.border}`, background: isPrivate ? T.sage : T.card, color: isPrivate ? '#fff' : T.text, fontWeight: 700, cursor: 'pointer' }}>
+              👤 Private
+            </button>
+            <button type="button" onClick={() => setD({ ...d, customerType: 'business', commissionRate: d.commissionRate === '0' ? '20' : d.commissionRate })}
+              style={{ flex: 1, padding: '10px 14px', borderRadius: 10, border: `2px solid ${!isPrivate ? T.sage : T.border}`, background: !isPrivate ? T.sage : T.card, color: !isPrivate ? '#fff' : T.text, fontWeight: 700, cursor: 'pointer' }}>
+              🏪 Business (Shop)
+            </button>
+          </div>
+          <div style={{ fontSize: 12, color: T.textSecondary, marginTop: 6 }}>
+            {isPrivate ? 'No commission — you get 100% of the sale.' : 'A shop that keeps a commission per sale.'}
+          </div>
+        </FormGroup>
+        <FormGroup label={isPrivate ? 'Customer name *' : 'Shop name *'}><input style={inputCls} value={d.name} onChange={(e) => setD({ ...d, name: e.target.value })} placeholder={isPrivate ? 'e.g. Yanki Halpern' : 'e.g. The Petal Studio'} autoFocus /></FormGroup>
+        <FormGroup label="Contact person"><input style={inputCls} value={d.contactName || ''} onChange={(e) => setD({ ...d, contactName: e.target.value })} placeholder="Name to reach out to" /></FormGroup>
         <FormGroup label="Phone"><input type="tel" style={inputCls} value={d.phone || ''} onChange={(e) => setD({ ...d, phone: e.target.value })} /></FormGroup>
         <FormGroup label="Email"><input type="email" style={inputCls} value={d.email || ''} onChange={(e) => setD({ ...d, email: e.target.value })} /></FormGroup>
         <FormGroup label="Address"><textarea rows={2} style={inputCls} value={d.address || ''} onChange={(e) => setD({ ...d, address: e.target.value })} /></FormGroup>
-        <FormGroup label="Commission rate (%)" hint="Percentage of sales the shop keeps. Default 20%.">
-          <input type="number" step="0.1" min="0" max="100" style={inputCls} value={d.commissionRate || ''} onChange={(e) => setD({ ...d, commissionRate: e.target.value })} />
-        </FormGroup>
+        {!isPrivate && (
+          <FormGroup label="Commission rate (%)" hint="Percentage of sales the shop keeps. Default 20%.">
+            <input type="number" step="0.1" min="0" max="100" style={inputCls} value={d.commissionRate || ''} onChange={(e) => setD({ ...d, commissionRate: e.target.value })} />
+          </FormGroup>
+        )}
         <FormGroup label="Notes"><textarea rows={2} style={inputCls} value={d.notes || ''} onChange={(e) => setD({ ...d, notes: e.target.value })} placeholder="Payment terms, preferences, etc." /></FormGroup>
       </div>
     </Modal>
@@ -1313,13 +1397,23 @@ function ConsignmentForm({ initial, shops, products, consignments, onSave, onClo
     invoiceNumber: generateInvoiceNumber(),
     shopId: shops[0]?.id || '',
     deliveryDate: new Date().toISOString().slice(0, 10),
-    commissionRate: shops[0]?.commissionRate || '20',
+    commissionRate: shops[0]?.customerType === 'private' ? '0' : (shops[0]?.commissionRate || '20'),
+    customerType: shops[0]?.customerType || 'private',
     items: [], status: 'active', notes: '',
   });
   const addItem = () => setD({ ...d, items: [...(d.items || []), { id: `i_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, productId: '', name: '', qty: 1, soldQty: 0, returnedQty: 0, price: 0 }] });
   const updateItem = (idx, patch) => setD({ ...d, items: d.items.map((it, i) => i === idx ? { ...it, ...patch } : it) });
   const removeItem = (idx) => setD({ ...d, items: d.items.filter((_, i) => i !== idx) });
-  const onShopChange = (shopId) => { const shop = shops.find(s => s.id === shopId); setD({ ...d, shopId, commissionRate: shop?.commissionRate || d.commissionRate }); };
+  const onShopChange = (shopId) => {
+    const shop = shops.find(s => s.id === shopId);
+    const cType = shop?.customerType || 'private';
+    setD({
+      ...d,
+      shopId,
+      customerType: cType,
+      commissionRate: cType === 'private' ? '0' : (shop?.commissionRate || d.commissionRate || '20'),
+    });
+  };
   const onProductPick = (idx, productId) => {
     const p = products.find(x => x.id === productId);
     if (p) updateItem(idx, { productId, name: p.name, price: p.price, cost: p.cost, unit: p.unit });
@@ -1334,7 +1428,8 @@ function ConsignmentForm({ initial, shops, products, consignments, onSave, onClo
   const subtotal = (d.items || []).reduce((s, it) => s + (parseFloat(it.price) || 0) * (parseInt(it.qty) || 0), 0);
   const sold = (d.items || []).reduce((s, it) => s + (parseFloat(it.price) || 0) * (parseInt(it.soldQty) || 0), 0);
   const returnedValue = (d.items || []).reduce((s, it) => s + (parseFloat(it.price) || 0) * (parseInt(it.returnedQty) || 0), 0);
-  const shopShare = sold * ((parseFloat(d.commissionRate) || 0) / 100);
+  const isPrivateForm = d.customerType === 'private';
+  const shopShare = isPrivateForm ? 0 : sold * ((parseFloat(d.commissionRate) || 0) / 100);
   const owedToYou = sold - shopShare;
   return (
     <Modal title={initial ? 'Edit Invoice' : 'New Invoice'} onClose={onClose} footer={<SaveBtn onClick={submit} />} wide>
@@ -1343,15 +1438,20 @@ function ConsignmentForm({ initial, shops, products, consignments, onSave, onClo
           <FormGroup label="Invoice #"><input style={inputCls} value={d.invoiceNumber} onChange={(e) => setD({ ...d, invoiceNumber: e.target.value })} /></FormGroup>
           <FormGroup label="Delivery date"><input type="date" style={inputCls} value={d.deliveryDate || ''} onChange={(e) => setD({ ...d, deliveryDate: e.target.value })} /></FormGroup>
         </div>
-        <FormGroup label="Shop *">
+        <FormGroup label="Customer *">
           <select style={inputCls} value={d.shopId} onChange={(e) => onShopChange(e.target.value)}>
-            <option value="">— Choose shop —</option>
-            {shops.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            <option value="">— Choose customer —</option>
+            {shops.map(s => <option key={s.id} value={s.id}>{s.name} {s.customerType === 'business' ? '🏪' : '👤'}</option>)}
           </select>
+          <div style={{ fontSize: 12, color: T.textSecondary, marginTop: 6 }}>
+            {isPrivateForm ? '👤 Private customer — no commission' : `🏪 Business — ${d.commissionRate}% commission`}
+          </div>
         </FormGroup>
-        <FormGroup label="Commission rate (%)" hint="Shop's percentage of each sale">
-          <input type="number" step="0.1" style={inputCls} value={d.commissionRate} onChange={(e) => setD({ ...d, commissionRate: e.target.value })} />
-        </FormGroup>
+        {!isPrivateForm && (
+          <FormGroup label="Commission rate (%)" hint="Shop's percentage of each sale">
+            <input type="number" step="0.1" style={inputCls} value={d.commissionRate} onChange={(e) => setD({ ...d, commissionRate: e.target.value })} />
+          </FormGroup>
+        )}
         <FormGroup label="Status">
           <select style={inputCls} value={d.status} onChange={(e) => setD({ ...d, status: e.target.value })}>
             <option value="active">Active — on sale at shop</option>
@@ -1397,7 +1497,7 @@ function ConsignmentForm({ initial, shops, products, consignments, onSave, onClo
           <Row label="Returned (not charged)" value={`-£${returnedValue.toFixed(2)}`} color={T.textTertiary} />
           <div style={{ height: 1, background: T.separator, margin: '6px 0' }} />
           <Row label="Sold value" value={`£${sold.toFixed(2)}`} color={T.sage} />
-          <Row label={`Shop's commission (${d.commissionRate}%)`} value={`-£${shopShare.toFixed(2)}`} color={T.textSecondary} />
+          {!isPrivateForm && <Row label={`Shop's commission (${d.commissionRate}%)`} value={`-£${shopShare.toFixed(2)}`} color={T.textSecondary} />}
           <div style={{ height: 1, background: T.separator, margin: '8px 0' }} />
           <Row label="You receive" value={`£${owedToYou.toFixed(2)}`} bold />
         </div>
@@ -1929,7 +2029,7 @@ function InvoiceView({ consign, shop, calc, onClose, onEdit, onUpdate, onDelete,
     lines.push('');
     lines.push('───────────────────────────────────');
     lines.push(`Sold value:                £${m.sold.toFixed(2)}`);
-    lines.push(`Less commission (${m.commissionRate}%):    -£${m.shopShare.toFixed(2)}`);
+    if (!m.isPrivate) lines.push(`Less commission (${m.commissionRate}%):    -£${m.shopShare.toFixed(2)}`);
     lines.push('───────────────────────────────────');
     lines.push(`AMOUNT DUE:                £${m.owedToYou.toFixed(2)}`);
     lines.push('═══════════════════════════════════');
@@ -2024,7 +2124,7 @@ function InvoiceView({ consign, shop, calc, onClose, onEdit, onUpdate, onDelete,
                 <Row label="Total delivered" value={`£${m.subtotal.toFixed(2)}`} />
                 <Row label="Sold" value={`£${m.sold.toFixed(2)}`} />
                 <Row label="Returned" value={`£${m.returnedValue.toFixed(2)}`} />
-                <Row label={`Shop commission (${m.commissionRate}%)`} value={`-£${m.shopShare.toFixed(2)}`} />
+                {!m.isPrivate && <Row label={`Shop commission (${m.commissionRate}%)`} value={`-£${m.shopShare.toFixed(2)}`} />}
                 <div style={{ height: 1, background: T.separatorOpaque, margin: '10px 0' }} />
                 <Row label="Amount due to Misty Blooms" value={`£${m.owedToYou.toFixed(2)}`} bold />
               </div>
@@ -2148,7 +2248,7 @@ function PrintableInvoice({ consign, shop, m, onClose }) {
     lines.push(`Total delivered:     GBP ${m.subtotal.toFixed(2)}`);
     lines.push(`Sold value:          GBP ${m.sold.toFixed(2)}`);
     lines.push(`Returned:            GBP ${m.returnedValue.toFixed(2)}`);
-    lines.push(`Shop commission ${m.commissionRate}%: GBP ${m.shopShare.toFixed(2)}`);
+    if (!m.isPrivate) lines.push(`Shop commission ${m.commissionRate}%: GBP ${m.shopShare.toFixed(2)}`);
     lines.push('-----------------------------------');
     lines.push(`AMOUNT DUE:          GBP ${m.owedToYou.toFixed(2)}`);
     lines.push('===================================');
@@ -2392,7 +2492,7 @@ function buildInvoiceHTML(consign, shop, m) {
       <div class="row muted"><span>Returned (not charged)</span><span>-£${m.returnedValue.toFixed(2)}</span></div>
       <div class="divider"></div>
       <div class="row"><span>Sold value</span><span>£${m.sold.toFixed(2)}</span></div>
-      <div class="row"><span>Less shop commission (${m.commissionRate}%)</span><span>-£${m.shopShare.toFixed(2)}</span></div>
+      ${m.isPrivate ? '' : `<div class="row"><span>Less shop commission (${m.commissionRate}%)</span><span>-£${m.shopShare.toFixed(2)}</span></div>`}
       <div class="row grand"><span>Amount due</span><span>£${m.owedToYou.toFixed(2)}</span></div>
     </div></div>
     <div class="bank">
@@ -2409,7 +2509,7 @@ function buildInvoiceHTML(consign, shop, m) {
       <ul>
         <li>Payment is due within <strong>7 days</strong> of invoice date.</li>
         <li>Goods are supplied on a sale-or-return basis. Only sold items are charged; returned items incur no fee.</li>
-        <li>Shop retains ${m.commissionRate}% commission on the sold value as agreed.</li>
+        ${m.isPrivate ? '' : `<li>Shop retains ${m.commissionRate}% commission on the sold value as agreed.</li>`}
         <li>Returns must be reported in good condition at the time of settlement.</li>
         <li>All prices in pounds sterling (£). Please reference invoice number ${escapeHtml(consign.invoiceNumber)} on payment.</li>
       </ul>
@@ -2664,7 +2764,9 @@ function ProfitLossModal({ onClose, consignments, purchases, products, shops, su
                       </div>
                     </div>
                     <div style={{ fontSize: 11, color: T.textTertiary, marginTop: 6, paddingTop: 6, borderTop: `0.5px dashed ${T.separator}` }}>
-                      Sold £{r.gross.toFixed(2)} − {((r.commission/r.gross)*100 || 0).toFixed(0)}% shop commission (£{r.commission.toFixed(2)})
+                      {r.commission > 0
+                        ? `Sold £${r.gross.toFixed(2)} − ${((r.commission/r.gross)*100 || 0).toFixed(0)}% shop commission (£${r.commission.toFixed(2)})`
+                        : `Sold £${r.gross.toFixed(2)} · 👤 Private customer (no commission)`}
                     </div>
                   </div>
                 ))}
